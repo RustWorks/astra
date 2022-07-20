@@ -1,3 +1,5 @@
+use crate::net::SharedStream;
+
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
@@ -7,47 +9,50 @@ use std::task::{Context, Poll, Wake};
 use std::thread::{self, Thread};
 use std::time::Duration;
 
-pub struct Parker {
-    thread: Thread,
-    parked: AtomicBool,
+#[derive(Clone)]
+pub struct LocalExecutor {
+    executor: Executor,
+    conn: SharedStream,
 }
 
-impl Parker {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Parker {
-            thread: thread::current(),
-            // start off as parked to ensure wakeups
-            // are seen in between polling and parking
-            parked: AtomicBool::new(true),
-        })
+impl LocalExecutor {
+    pub fn new(executor: Executor, conn: SharedStream) -> Self {
+        Self { executor, conn }
     }
 }
 
-impl Wake for Parker {
-    fn wake(self: Arc<Self>) {
-        if self.parked.swap(false, Ordering::Release) {
-            self.thread.unpark();
-        }
+impl<F> hyper::rt::Executor<F> for LocalExecutor
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    fn execute(&self, fut: F) {
+        self.executor.execute(fut, self.conn.clone());
     }
 }
 
-impl Parker {
-    pub fn block_on<F>(self: &Arc<Self>, mut fut: F) -> F::Output
+struct LocalParker {
+    conn: SharedStream,
+}
+
+impl LocalParker {
+    pub fn new(conn: SharedStream) -> LocalParker {
+        LocalParker { conn }
+    }
+}
+
+impl LocalParker {
+    pub fn block_on<F>(&self, mut fut: F) -> F::Output
     where
         F: Future,
     {
-        let waker = self.clone().into();
-        let mut cx = Context::from_waker(&waker);
-
+        let mut cx = Context::from_waker(futures_task::noop_waker_ref());
         let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
+
         loop {
             match fut.as_mut().poll(&mut cx) {
                 Poll::Ready(res) => break res,
                 Poll::Pending => {
-                    // wait for a real wakeup
-                    while self.parked.swap(true, Ordering::Acquire) {
-                        thread::park();
-                    }
+                    self.conn.park().unwrap();
                 }
             }
         }
@@ -67,7 +72,7 @@ struct Inner {
 }
 
 struct Shared {
-    queue: VecDeque<Box<dyn Future<Output = ()> + Send>>,
+    queue: VecDeque<(Box<dyn Future<Output = ()> + Send>, SharedStream)>,
     workers: usize,
     idle: usize,
     notified: usize,
@@ -89,15 +94,13 @@ impl Executor {
             }),
         }
     }
-}
 
-impl<F> hyper::rt::Executor<F> for Executor
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    fn execute(&self, fut: F) {
+    pub fn execute<F>(&self, fut: F, conn: SharedStream)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
         let mut shared = self.inner.shared.lock().unwrap();
-        shared.queue.push_back(Box::new(fut));
+        shared.queue.push_back((Box::new(fut), conn));
 
         if shared.idle == 0 {
             if shared.workers != self.inner.max_workers {
@@ -118,13 +121,12 @@ where
 
 impl Inner {
     fn run(&self) {
-        let parker = Parker::new();
-
         let mut shared = self.shared.lock().unwrap();
 
         'alive: loop {
-            while let Some(task) = shared.queue.pop_front() {
+            while let Some((task, fd)) = shared.queue.pop_front() {
                 drop(shared);
+                let parker = LocalParker::new(fd);
                 parker.block_on(Pin::from(task));
                 shared = self.shared.lock().unwrap();
             }
@@ -148,5 +150,49 @@ impl Inner {
 
         shared.workers -= 1;
         shared.idle -= 1;
+    }
+}
+
+pub fn block_on<F>(mut fut: F) -> F::Output
+where
+    F: Future,
+{
+    struct Parker {
+        thread: Thread,
+        parked: AtomicBool,
+    }
+
+    impl Parker {
+        pub fn new() -> Arc<Self> {
+            Arc::new(Parker {
+                thread: thread::current(),
+                parked: AtomicBool::new(true),
+            })
+        }
+    }
+
+    impl Wake for Parker {
+        fn wake(self: Arc<Self>) {
+            if self.parked.swap(false, Ordering::Release) {
+                self.thread.unpark();
+            }
+        }
+    }
+
+    let parker = Parker::new();
+    let waker = parker.clone().into();
+    let mut cx = Context::from_waker(&waker);
+
+    let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
+    loop {
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(res) => break res,
+            Poll::Pending => {
+                // wait for a real wakeup
+                while parker.parked.swap(true, Ordering::Acquire) {
+                    thread::park();
+                }
+            }
+        }
     }
 }

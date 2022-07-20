@@ -1,5 +1,5 @@
-use crate::net::Reactor;
-use crate::{executor, Body, Request, Response};
+use crate::net::SharedStream;
+use crate::{executor, net, Body, Request, Response};
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -10,7 +10,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use hyper::rt::Executor;
 use hyper::server::conn::Http;
 
 /// An HTTP server.
@@ -130,26 +129,30 @@ impl Server {
         S: Service,
     {
         let executor = executor::Executor::new(self.max_workers, self.worker_keep_alive);
-        let mut http = Http::new().with_executor(executor.clone());
+        let mut http = Http::new();
         self.configure(&mut http);
 
         let service = Arc::new(service);
-        let reactor = Reactor::new().expect("failed to create reactor");
 
         for conn in self.listener.unwrap().incoming() {
-            let conn = conn.and_then(|stream| reactor.register(stream))?;
-            let service = service.clone();
-            let builder = http.clone();
+            let conn = SharedStream(Arc::new(net::TcpStream::new(conn?)?));
 
-            executor.execute(async move {
+            let service = service.clone();
+            let builder = http
+                .clone()
+                .with_executor(executor::LocalExecutor::new(executor.clone(), conn.clone()));
+
+            let conn_ = conn.clone();
+            let serve = async move {
                 if let Err(err) = builder
-                    .clone()
-                    .serve_connection(conn, service::HyperService(service))
+                    .serve_connection(conn_, service::HyperService(service))
                     .await
                 {
                     log::error!("error serving connection: {}", err);
                 }
-            });
+            };
+
+            executor.execute(serve, conn);
         }
 
         Ok(())
